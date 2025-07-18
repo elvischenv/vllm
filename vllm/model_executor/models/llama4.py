@@ -564,6 +564,11 @@ class Llama4ForCausalLM(LlamaForCausalLM):
             attn_in = self.config.head_dim * n_heads
             attn_out = self.config.hidden_size
 
+            if self.model.quant_config.get_name() == "modelopt_fp4":
+                return w.view(n_heads, attn_in // n_heads // 2, 2,
+                              attn_out // 2).transpose(1, 2).reshape(
+                                  attn_in, attn_out // 2)
+
             return w.view(n_heads, attn_in // n_heads // 2, 2,
                           attn_out).transpose(1, 2).reshape(attn_in, attn_out)
 
