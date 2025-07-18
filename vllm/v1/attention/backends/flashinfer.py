@@ -481,6 +481,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
 class FlashInferImpl(AttentionImpl):
 
+    mha_counts = 0
+
     def __init__(
         self,
         num_heads: int,
@@ -635,9 +637,36 @@ class FlashInferImpl(AttentionImpl):
                 v_scale=layer._v_scale_float,
                 out=output[num_decode_tokens:],
             )
+
+        ENABLE_LOG = False
         if decode_wrapper := attn_metadata.decode_wrapper:
             decode_query = query[:num_decode_tokens]
             assert decode_query.shape[0] == num_decode_tokens
+
+            if ENABLE_LOG:
+                print(
+                    "ARGS",
+                    FlashInferImpl.mha_counts,
+                    ": num_heads:",
+                    self.num_heads,
+                    ", num_kv_heads:",
+                    self.num_kv_heads,
+                    ", max_seq_len:",
+                    attn_metadata.max_seq_len,
+                    ", decode batch_size:",
+                    attn_metadata.num_decodes,
+                    ", num_decode_tokens:",
+                    num_decode_tokens,
+                    ", prefill batch_size:",
+                    attn_metadata.num_prefills,
+                    ", num_prefill_tokens:",
+                    num_prefill_tokens,
+                )
+                # print("attn_metadata:")
+                # print(attn_metadata, "\n")
+
+            output2 = output.clone()
+
             if not FlashInferBackend.use_trtllm_decode_attention(
                     attn_metadata.num_decodes, attn_metadata.max_seq_len,
                     self.kv_cache_dtype, attn_metadata.num_qo_heads,
@@ -654,6 +683,16 @@ class FlashInferImpl(AttentionImpl):
                     v_scale=layer._v_scale_float,
                     out=output[:num_decode_tokens],
                 )
+
+                if ENABLE_LOG:
+                    output_tensor = output[:num_decode_tokens]
+                    print("ORIG tensor:")
+                    print(output_tensor)
+                    print("ORIG shape:", output_tensor.shape, "max:",
+                          output_tensor.max().item(), "min:",
+                          output_tensor.min().item(), "mean:",
+                          output_tensor.mean().item(), "var:",
+                          output_tensor.var().item())
             else:
                 # This path needs to be enabled with VLLM_KV_CACHE_LAYOUT = HND
                 if num_decode_tokens > 0:
@@ -670,7 +709,8 @@ class FlashInferImpl(AttentionImpl):
                     assert block_tables_decode.is_contiguous()
                     assert seq_lens_decode.is_contiguous()
 
-                    output[:num_decode_tokens] = (
+                    # output[:num_decode_tokens] = (
+                    output2[:num_decode_tokens] = (
                         trtllm_batch_decode_with_kv_cache(
                             query=decode_query,
                             kv_cache=kv_cache_permute,
@@ -686,4 +726,52 @@ class FlashInferImpl(AttentionImpl):
                             k_scale=layer._k_scale_float,
                             v_scale=layer._v_scale_float,
                         ))
+
+                    # comment when else is commented out
+                    output[:num_decode_tokens] = output2[:num_decode_tokens]
+
+                    if ENABLE_LOG:
+                        output_tensor2 = output2[:num_decode_tokens]
+                        print("TRTL tensor:")
+                        print(output_tensor2)
+                        print("TRTL shape:", output_tensor2.shape, "max:",
+                              output_tensor2.max().item(), "min:",
+                              output_tensor2.min().item(), "mean:",
+                              output_tensor2.mean().item(), "var:",
+                              output_tensor2.var().item())
+
+                        # check the gap between the two outputs using atol, rtol
+                        # atol = 5e-2
+                        # rtol = 1e-2
+
+                        # errors = ~torch.isclose(output_tensor2,
+                        #                         output_tensor,
+                        #                         atol=atol,
+                        #                         rtol=rtol)
+                        # num_errors = errors.sum().item()
+                        # total = output_tensor.numel()
+                        # error_rate = num_errors / total
+
+                        # if num_errors > 0:
+                        #     print("GAP")
+
+                        # print("Total:", total, "Error:", num_errors, "Ratio:",
+                        #       f"{error_rate:.4f}")
+
+                        # gap = torch.abs(output_tensor2 - output_tensor)
+                        # print(
+                        #     "max:",
+                        #     gap.max().item(),
+                        #     "min:",
+                        #     gap.min().item(),
+                        #     "mean:",
+                        #     gap.mean().item(),
+                        #     "var:",
+                        #     gap.var().item(),
+                        # )
+
+            if ENABLE_LOG:
+                print()
+                FlashInferImpl.mha_counts += 1
+
         return output_padded
