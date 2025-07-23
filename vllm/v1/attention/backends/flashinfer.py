@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, ClassVar, Optional
 
 import torch
 from flashinfer import (BatchDecodeWithPagedKVCacheWrapper,
@@ -17,6 +17,8 @@ from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionType)
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    GroupShape)
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.flash_attn import use_cascade_attention
 from vllm.v1.attention.backends.utils import (
@@ -223,6 +225,7 @@ class FlashInferMetadata:
 
 
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+    full_cudagraph_supported: ClassVar[bool] = True  # Decode-only
 
     def __init__(self, kv_cache_spec: AttentionSpec, vllm_config: VllmConfig,
                  device: torch.device):
@@ -517,6 +520,11 @@ class FlashInferImpl(AttentionImpl):
                                       "are not implemented for "
                                       "FlashInferImpl")
 
+    def fused_output_quant_supported(self, dtype: torch.dtype, static: bool,
+                                     group_shape: GroupShape):
+        return dtype == current_platform.fp8_dtype(
+        ) and static and group_shape == GroupShape.PER_TENSOR
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -546,9 +554,9 @@ class FlashInferImpl(AttentionImpl):
         assert output is not None, "Output tensor must be provided."
 
         if output_scale is not None:
-            raise NotImplementedError(
-                "fused output quantization is not yet supported"
-                " for FlashInferImpl")
+            logger.info_once("Using output_scale")
+            assert query.dtype == current_platform.fp8_dtype()
+            assert self.kv_cache_dtype.startswith("fp8")
 
         if attn_metadata is None:
             # Profiling run.
