@@ -17,6 +17,8 @@ from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionType)
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    GroupShape)
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.flash_attn import use_cascade_attention
 from vllm.v1.attention.backends.utils import (
@@ -516,6 +518,11 @@ class FlashInferImpl(AttentionImpl):
                                       "encoder/decoder cross-attention "
                                       "are not implemented for "
                                       "FlashInferImpl")
+
+    def fused_output_quant_supported(self, dtype: torch.dtype, static: bool,
+                                     group_shape: GroupShape):
+        return dtype == current_platform.fp8_dtype(
+        ) and static and group_shape == GroupShape.PER_TENSOR
 
     def forward(
         self,

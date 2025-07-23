@@ -54,6 +54,7 @@ class AttentionStaticQuantPattern:
                                                    self.quant_key.static,
                                                    self.quant_key.group_shape):
             self._register(pm_pass)
+            # self._register2(pm_pass)
 
     def _register(self, pm_pass: PatternMatcherPass):
 
@@ -124,6 +125,90 @@ class AttentionStaticQuantPattern:
                 pattern, replacement, inputs,
                 wrap_trace_fn(fx_view_to_reshape, pm.fwd_only), pm_pass)
 
+    def _register2(self, pm_pass: PatternMatcherPass):
+
+        def pattern(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                    scale: torch.Tensor, output: torch.Tensor):
+            # attention out in q.dtype
+            attn_out = torch.ops.aten.full.default(
+                [q.shape[0], self.num_heads, self.head_size],
+                0.0,
+                dtype=q.dtype,
+                device=q.device)
+            # attention
+            at1 = auto_functionalized(ATTN_OP,
+                                      query=q,
+                                      key=k,
+                                      value=v,
+                                      output=attn_out,
+                                      layer_name=self.layer_name,
+                                      output_scale=None)
+            # reshape
+            attn_out_view = RESHAPE_OP(at1[1],
+                                       [-1, self.num_heads * self.head_size])
+            # quant
+            at2 = auto_functionalized(self.QUANT_OP,
+                                      result=output,
+                                      input=attn_out_view,
+                                      scale=scale)
+            return at2[1]
+
+        def replacement(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                        scale: torch.Tensor, output: torch.Tensor):
+            # attention out in quant_dtype
+            attn_out = torch.ops.aten.full.default(
+                [q.shape[0], self.num_heads, self.head_size],
+                0.0,
+                dtype=self.quant_dtype,
+                device=q.device)
+            # q in quant_dtype
+            q_quant = torch.ops.aten.empty.memory_format(
+                [q.shape[0], self.num_heads, self.head_size],
+                dtype=self.quant_dtype,
+                device=q.device)
+            at1 = auto_functionalized(self.QUANT_OP,
+                                      result=q_quant,
+                                      input=q,
+                                      scale=scale)
+            # attention
+            at2 = auto_functionalized(ATTN_OP,
+                                      query=at1[1],
+                                      key=k,
+                                      value=v,
+                                      output=attn_out,
+                                      layer_name=self.layer_name,
+                                      output_scale=scale)
+            # reshape
+            output = RESHAPE_OP(at2[1], [-1, self.num_heads * self.head_size])
+            return output
+
+        # Need custom fake mode, otherwise tracing happens with real tensors.
+        # That would not work for the unified_attention custom op.
+        with unset_fake_temporarily(), FakeTensorMode():
+            inputs = [
+                empty_bf16(5, self.num_heads, self.head_size),  # q
+                empty_bf16(5, self.num_heads, self.head_size),  # k
+                empty_bf16(5, self.num_heads, self.head_size),  # v
+                empty_fp32(1, 1),  # scale
+                self.empty_quant(5, self.num_heads * self.head_size),  # output
+            ]
+
+            def wrap_trace_fn(process_fx, trace_fn):
+
+                def wrapped(*args, **kwargs):
+                    return process_fx(trace_fn(*args, **kwargs))
+
+                return wrapped
+
+            def fx_view_to_reshape(gm: torch.fx.GraphModule):
+                from torch._inductor.fx_passes.post_grad import view_to_reshape
+                view_to_reshape(gm)
+                return gm
+
+            pm.register_replacement(
+                pattern, replacement, inputs,
+                wrap_trace_fn(fx_view_to_reshape, pm.fwd_only), pm_pass)
+
 
 class AttnFusionPass(VllmInductorPass):
     """
@@ -161,6 +246,6 @@ class AttnFusionPass(VllmInductorPass):
         self.dump_graph(graph, "before_attn_fusion")
 
         count = self.patterns.apply(graph)
-        logger.debug("Fused quantization onto %s attention nodes", count)
+        logger.info("Fused quantization onto %s attention nodes", count)
         self.dump_graph(graph, "after_attn_fusion")
         self.end_and_log()
