@@ -14,6 +14,7 @@ from logging import DEBUG
 from typing import Any, TypeVar, cast
 
 import msgspec
+import torch
 import zmq
 
 from vllm.config import ParallelConfig, VllmConfig
@@ -95,6 +96,19 @@ class EngineCore:
                 VLLM_VERSION,
                 vllm_config,
             )
+
+        self._profile_current_step = 0
+        self.profiler_start_iters, self.profiler_stop_iters = (
+            self._get_profiler_iteration_index_env_var("VLLM_PROFILE_START_STOP")
+        )
+        self.print_profile_step_iteration_info = (
+            os.environ.get("VLLM_PROFILE_ITERATION_INFO", "").lower() == "true"
+        )
+        # The dict initially records each request's context token size.
+        # After processing, the size will decrease.
+        # When this size <= 0, then it means this request is in generation
+        # phase. This helps to collect iteration info.
+        self.schedule_requests: dict[str, int] = {}
 
         self.log_stats = log_stats
 
@@ -345,6 +359,15 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule()
+
+        ### nsys profiling
+        self._profile_current_step = self._profile_current_step + 1
+        if self._profile_current_step in self.profiler_start_iters:
+            torch.cuda.cudart().cudaProfilerStart()
+        if self._profile_current_step in self.profiler_stop_iters:
+            torch.cuda.cudart().cudaProfilerStop()
+        self._profile_step_iteration_info(scheduler_output)
+
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with self.log_error_detail(scheduler_output):
@@ -467,6 +490,14 @@ class EngineCore:
             future = self.model_executor.sample_tokens(grammar_output, non_block=True)
             batch_queue.appendleft((future, deferred_scheduler_output))
 
+        ### nsys profiling
+        self._profile_current_step = self._profile_current_step + 1
+        if self._profile_current_step in self.profiler_start_iters:
+            torch.cuda.cudart().cudaProfilerStart()
+        if self._profile_current_step in self.profiler_stop_iters:
+            torch.cuda.cudart().cudaProfilerStop()
+        self._profile_step_iteration_info(scheduler_output)
+
         return engine_core_outputs, model_executed
 
     def _process_aborts_queue(self):
@@ -555,6 +586,60 @@ class EngineCore:
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
         return self.model_executor.collective_rpc(method, timeout, args, kwargs)
+
+    def _get_profiler_iteration_index_env_var(
+        self, name: str
+    ) -> tuple[frozenset[int], frozenset[int]]:
+        spans = os.environ.get(name, None)
+        starts, stops = [], []
+
+        if spans:
+            spans_list = spans.split(",")
+
+            for span in spans_list:
+                try:
+                    if "-" in span:
+                        start, stop = span.strip().split("-")
+                        starts.append(int(start))
+                        stops.append(int(stop))
+                    else:
+                        it = int(span.strip())
+                        starts.append(it)
+                        stops.append(it)
+                except ValueError as e:
+                    raise ValueError(
+                        f"Cannot parse span in environment variable `{name}`: {e}"
+                    ) from None
+
+        return frozenset(starts), frozenset(stops)
+
+    def _profile_step_iteration_info(self, scheduler_output: SchedulerOutput):
+        if not self.print_profile_step_iteration_info:
+            return
+
+        for new_req in scheduler_output.scheduled_new_reqs:
+            self.schedule_requests[new_req.req_id] = len(new_req.prompt_token_ids)
+
+        num_ctx_requests = 0
+        num_ctx_tokens = 0
+        num_generation_tokens = 0
+        for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
+            if self.schedule_requests[req_id] > 0:
+                num_ctx_requests += 1
+                num_ctx_tokens += num_tokens
+                self.schedule_requests[req_id] -= num_tokens
+            else:
+                num_generation_tokens += 1
+
+        logger.info(
+            "iter = %d, num_scheduled_requests: %d, num_ctx_requests: %d, "
+            "num_ctx_tokens: %d, num_generation_tokens: %d",
+            self._profile_current_step,
+            num_ctx_requests + num_generation_tokens,
+            num_ctx_requests,
+            num_ctx_tokens,
+            num_generation_tokens,
+        )
 
     def preprocess_add_request(self, request: EngineCoreRequest) -> tuple[Request, int]:
         """Preprocess the request.
