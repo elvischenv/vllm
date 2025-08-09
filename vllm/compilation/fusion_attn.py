@@ -19,7 +19,8 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.platforms import current_platform
 
-from .fusion import QUANT_OPS, GroupShape, QuantKey, empty_bf16, empty_fp32
+from .fusion import (QUANT_OPS, GroupShape, QuantKey, empty_bf16, empty_fp32,
+                     empty_i32)
 from .vllm_inductor_pass import VllmInductorPass
 
 logger = init_logger(__name__)
@@ -172,11 +173,14 @@ class QuantAttentionQuantPattern(AttentionQuantPattern):
         cache_file: Optional[str] = None,
     ):
         # for matching post quant
-        assert quant_dtype == current_platform.fp8_dtype()
-        quant_key = QuantKey(dtype=quant_dtype,
-                             static=True,
-                             group_shape=GroupShape.PER_TENSOR,
-                             symmetric=True)
+        # assert quant_dtype == current_platform.fp8_dtype()
+        if quant_dtype == current_platform.fp8_dtype():
+            quant_key = QuantKey(dtype=quant_dtype,
+                                 static=True,
+                                 group_shape=GroupShape.PER_TENSOR,
+                                 symmetric=True)
+        elif quant_dtype == torch.uint8:
+            quant_key = QuantKey(dtype=quant_dtype)
         super().__init__(layer, quant_key)
 
         # for inserting pre quant
@@ -201,7 +205,10 @@ class QuantAttentionQuantPattern(AttentionQuantPattern):
                 and attn_impl.insert_query_quant_supported(
                     self.pre_quant_key.dtype, self.pre_quant_key.static,
                     self.pre_quant_key.group_shape)):
-            self._register(pm_pass)
+            if self.quant_key.dtype == current_platform.fp8_dtype():
+                self._register(pm_pass)
+            elif self.quant_key.dtype == torch.uint8:
+                self._register2(pm_pass)
 
     def _register(self, pm_pass: PatternMatcherPass):
 
@@ -300,6 +307,123 @@ class QuantAttentionQuantPattern(AttentionQuantPattern):
                 pattern, replacement, inputs,
                 self.wrap_trace_fn(self.fx_view_to_reshape, pm.fwd_only),
                 pm_pass, extra_check)
+
+    def _register2(self, pm_pass: PatternMatcherPass):
+
+        def pattern(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                    q_scale: torch.Tensor, output_scale: torch.Tensor,
+                    i32_out_scale: torch.Tensor):
+            # attention out in q.dtype
+            attn_out = torch.ops.aten.full.default(
+                [q.shape[0], self.num_heads, self.head_size],
+                0.0,
+                dtype=q.dtype,
+                device=q.device)
+            u8_out = torch.ops.aten.empty.memory_format(
+                [q.shape[0], self.num_heads * self.head_size // 2],
+                dtype=self.quant_dtype,
+                device=q.device)
+            # attention
+            at1 = auto_functionalized(ATTN_OP,
+                                      query=q,
+                                      key=k,
+                                      value=v,
+                                      output=attn_out,
+                                      layer_name=self.layer_name,
+                                      query_scale=q_scale,
+                                      output_scale=None,
+                                      output_scale_factor=None)
+            # reshape
+            attn_out_view = RESHAPE_OP(at1[1],
+                                       [-1, self.num_heads * self.head_size])
+
+            # i32 output scale
+            # i32_out_scale = torch.ops.aten.empty.memory_format(
+            #     [output.shape[0], self.num_heads * self.head_size // 16 // 4],
+            #     dtype=torch.int32,
+            #     device=q.device)
+            # quant
+            at2 = auto_functionalized(self.QUANT_OP,
+                                      output=u8_out,
+                                      input=attn_out_view,
+                                      output_scale=i32_out_scale,
+                                      input_scale=output_scale)
+            # view to fp8 scale
+            output_scale_factor = torch.ops.aten.view.dtype(
+                at2[2], torch.float8_e4m3fn)
+
+            # empty_3: "u8[s0, 4096]" = torch.ops.aten.empty.memory_format([arg1_1, 4096], dtype = torch.uint8, device = device(type='cuda', index=0), pin_memory = False)
+            # view_32: "bf16[s0, 8192]" = torch.ops.aten.reshape.default(getitem_44, [-1, 8192]);  getitem_44 = None
+            # empty_4: "i32[128*(((s0 + 127)//128)), 128]" = torch.ops.aten.empty.memory_format([mul_24, 128], dtype = torch.int32, device = device(type='cuda', index=0), pin_memory = False)
+            # reciprocal_1: "f32[]" = torch.ops.aten.reciprocal.default(arg11_1);  arg11_1 = None
+            # mul_132: "f32[]" = torch.ops.aten.mul.Tensor(reciprocal_1, 1);  reciprocal_1 = None
+            # auto_functionalized_3 = torch.ops.higher_order.auto_functionalized(torch.ops._C.scaled_fp4_quant.default, output = empty_3, input = view_32, output_scale = empty_4, input_scale = mul_132);  empty_3 = view_32 = empty_4 = mul_132 = None
+            # view_34: "f8e4m3fn[128*(((s0 + 127)//128)), 512]" = torch.ops.aten.view.dtype(getitem_47, torch.float8_e4m3fn);  getitem_47 = None
+            return at2[1], output_scale_factor
+
+        def replacement(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                        q_scale: torch.Tensor, output_scale: torch.Tensor,
+                        i32_out_scale: torch.Tensor):
+            # attention out in quant_dtype
+            attn_out = torch.ops.aten.full.default(
+                [q.shape[0], self.num_heads, self.head_size // 2],
+                0.0,
+                dtype=self.quant_dtype,
+                device=q.device)
+            # attention out scale factor
+            fp8_out_scale = torch.ops.aten.empty.memory_format(
+                [
+                    i32_out_scale.shape[0],
+                    self.num_heads * self.head_size // 16
+                ],
+                dtype=current_platform.fp8_dtype(),
+                device=q.device)
+            # q in pre_quant_dtype
+            q_quant = torch.ops.aten.empty.memory_format(
+                [q.shape[0], self.num_heads * self.head_size],
+                dtype=self.pre_quant_dtype,
+                device=q.device)
+            # reshape q
+            q_view1 = RESHAPE_OP(q, [-1, self.num_heads * self.head_size])
+            # quant q
+            at1 = auto_functionalized(self.PRE_QUANT_OP,
+                                      result=q_quant,
+                                      input=q_view1.contiguous(),
+                                      scale=q_scale)
+            # reshape q
+            q_view2 = RESHAPE_OP(at1[1], [-1, self.num_heads, self.head_size])
+            # attention
+            at2 = auto_functionalized(ATTN_OP,
+                                      query=q_view2,
+                                      key=k,
+                                      value=v,
+                                      output=attn_out,
+                                      layer_name=self.layer_name,
+                                      query_scale=q_scale,
+                                      output_scale=output_scale,
+                                      output_scale_factor=fp8_out_scale)
+            # reshape
+            output = RESHAPE_OP(at2[1],
+                                [-1, self.num_heads * self.head_size // 2])
+            return output, at2[2]
+
+        # Need custom fake mode, otherwise tracing happens with real tensors.
+        # That would not work for the unified_attention custom op.
+        with unset_fake_temporarily(), FakeTensorMode():
+            inputs = [
+                empty_bf16(5, self.num_heads, self.head_size),  # q
+                empty_bf16(5, self.num_heads, self.head_size),  # k
+                empty_bf16(5, self.num_heads, self.head_size),  # v
+                empty_fp32(1, 1),  # q_scale
+                empty_fp32(1, 1),  # output_scale
+                empty_i32(5, self.num_heads * self.head_size // 16 //
+                          4),  # i32_out_scale
+            ]
+
+            pm.register_replacement(
+                pattern, replacement, inputs,
+                self.wrap_trace_fn(self.fx_view_to_reshape, pm.fwd_only),
+                pm_pass)
 
 
 class AttnFusionPass(VllmInductorPass):
@@ -432,3 +556,10 @@ class AttnFusionPass(VllmInductorPass):
                 pre_quant_dtype=current_platform.fp8_dtype(),
                 cache_file=cache_file)
             pattern2.register_if_supported(self.patterns)
+
+            pattern3 = QuantAttentionQuantPattern(
+                layer,
+                quant_dtype=torch.uint8,
+                pre_quant_dtype=current_platform.fp8_dtype(),
+                cache_file=cache_file)
+            pattern3.register_if_supported(self.patterns)

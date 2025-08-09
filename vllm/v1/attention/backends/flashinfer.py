@@ -673,8 +673,8 @@ class FlashInferImpl(AttentionImpl):
 
     def fused_output_quant_supported(self, dtype: torch.dtype, static: bool,
                                      group_shape: GroupShape):
-        supported_quant_type = (dtype == current_platform.fp8_dtype() and static
-                                and group_shape == GroupShape.PER_TENSOR)
+        supported_quant_type = ((dtype == current_platform.fp8_dtype() and static
+                                and group_shape == GroupShape.PER_TENSOR) or (dtype == torch.uint8))
         return (self.support_trtllm_attn
                 and self.kv_cache_dtype.startswith("fp8")
                 and supported_quant_type)
@@ -697,6 +697,7 @@ class FlashInferImpl(AttentionImpl):
         attn_metadata: FlashInferMetadata,
         output: Optional[torch.Tensor] = None,
         output_scale: Optional[torch.Tensor] = None,
+        output_scale_factor: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass with FlashInfer.
 
@@ -718,6 +719,9 @@ class FlashInferImpl(AttentionImpl):
         if attn_metadata is None:
             # Profiling run.
             return output
+
+        if output_scale_factor is not None:
+            pass
 
         bmm1_scale = layer._q_scale_float * layer._k_scale_float * self.scale
         bmm2_scale = layer._v_scale_float
@@ -879,7 +883,15 @@ class FlashInferImpl(AttentionImpl):
                 assert block_tables_decode.is_contiguous()
                 assert seq_lens_decode.is_contiguous()
 
-                trtllm_batch_decode_with_kv_cache(
+                # if output_scale_factor is not None:
+                #     real_out = FP4Tensor(
+                #         data=output[:num_decode_tokens],
+                #         scale=output_scale_factor,
+                #         original_shape=decode_query.shape)
+                # else:
+                #     real_out = output[:num_decode_tokens]
+
+                out = trtllm_batch_decode_with_kv_cache(
                     query=decode_query,
                     kv_cache=kv_cache_permute,
                     workspace_buffer=workspace_buffer,
@@ -891,7 +903,17 @@ class FlashInferImpl(AttentionImpl):
                     window_left=self.window_left,
                     sinks=self.sinks,
                     out=output[:num_decode_tokens],
+                    # out=real_out,
+                    o_sf_scale=layer._o_scale_float,
+                    out_dtype="nvfp4",
                 )
+
+                # if output_scale_factor is not None:
+                #     output[:num_decode_tokens] = out.data
+                #     output_scale_factor = real_out.scale
+                # else:
+                #     output[:num_decode_tokens] = real_out
+
         return output_padded
 
 
