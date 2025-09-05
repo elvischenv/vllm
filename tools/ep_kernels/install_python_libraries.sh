@@ -23,6 +23,9 @@ wget https://github.com/deepseek-ai/DeepEP/raw/main/third-party/nvshmem.patch
 git init
 git apply -vvv nvshmem.patch
 
+# Fix MLX5_lib not found
+sed -i 's/find_library(MLX5_lib NAMES mlx5)/find_library(MLX5_lib NAMES mlx5 libmlx5.so.1)/' src/CMakeLists.txt
+
 # assume CUDA_HOME is set correctly
 if [ -z "$CUDA_HOME" ]; then
     echo "CUDA_HOME is not set, please set it to your CUDA installation directory."
