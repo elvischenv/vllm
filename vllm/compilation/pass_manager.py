@@ -63,6 +63,8 @@ class PostGradPassManager(CustomGraphPass):
 
         if self.pass_config.enable_fusion:
             self.passes += [FusionPass.instance(config)]
+
+        if self.pass_config.enable_silu_mul_fusion:
             self.passes += [ActivationQuantFusionPass(config)]
 
         if self.pass_config.enable_attn_fusion:

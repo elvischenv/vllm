@@ -56,7 +56,9 @@ def test_fix_functionalization(model: str, quant_key: QuantKey,
 
     vllm_config = VllmConfig()
     vllm_config.compilation_config = CompilationConfig(
-        pass_config=PassConfig(enable_fusion=do_fusion, enable_noop=True))
+        pass_config=PassConfig(enable_fusion=do_fusion,
+                               enable_silu_mul_fusion=do_fusion,
+                               enable_noop=True))
     noop_pass = NoOpEliminationPass(vllm_config)
     fusion_pass = FusionPass.instance(vllm_config)
     act_quant_fusion_pass = ActivationQuantFusionPass(vllm_config)

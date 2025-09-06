@@ -114,7 +114,7 @@ def test_fusion_silu_and_mul_quant(num_tokens, hidden_size, model_class,
     # Reshape pass is needed for the fusion pass to work
     config = VllmConfig()
     config.compilation_config = CompilationConfig(
-        pass_config=PassConfig(enable_fusion=True, enable_noop=True))
+        pass_config=PassConfig(enable_silu_mul_fusion=True, enable_noop=True))
     fusion_pass = ActivationQuantFusionPass(config)
 
     backend = TestBackend(NoOpEliminationPass(config), fusion_pass)

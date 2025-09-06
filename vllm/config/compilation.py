@@ -76,7 +76,10 @@ class PassConfig:
     the `PassManager` is set as a property of config."""
 
     enable_fusion: bool = field(default_factory=lambda: not envs.VLLM_USE_V1)
-    """Whether to enable the custom fusion (RMSNorm/SiluMul+quant) pass."""
+    """Whether to enable the custom fusion RMSNorm pass."""
+    enable_silu_mul_fusion: bool = field(
+        default_factory=lambda: not envs.VLLM_USE_V1)
+    """Whether to enable the custom fusion SiluMul+quant pass."""
     enable_attn_fusion: bool = False
     """Whether to enable the custom attention+quant fusion pass."""
     enable_noop: bool = field(default_factory=lambda: not envs.VLLM_USE_V1)
@@ -105,7 +108,11 @@ class PassConfig:
             if self.enable_fusion:
                 logger.warning_once(
                     "Fusion enabled but reshape elimination disabled. "
-                    "RMSNorm/SiluMul + quant (fp8) fusion might not work")
+                    "RMSNorm + quant (fp8) fusion might not work")
+            if self.enable_silu_mul_fusion:
+                logger.warning_once(
+                    "Fusion enabled but reshape elimination disabled. "
+                    "SiluMul + quant (fp8) fusion might not work")
             if self.enable_attn_fusion:
                 logger.warning_once(
                     "Fusion enabled but reshape elimination disabled. "
