@@ -345,8 +345,6 @@ else:
 @pytest.mark.skipif(current_platform.is_cuda()
                     and not current_platform.is_device_capability((10, 0)),
                     reason="On CUDA only test on SM100(Blackwell)")
-@pytest.mark.skipif(not current_platform.is_cuda_alike(),
-                    reason="Only test ROCm or CUDA")
 def test_attention_quant_pattern(num_qo_heads: int, num_kv_heads: int,
                                  head_size: int, batch_size: int,
                                  dtype: torch.dtype, model_name: str,

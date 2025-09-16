@@ -16,7 +16,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.utils import round_up
 
-from .fusion import QUANT_OPS, empty_bf16, empty_fp32, empty_i32
+from .fusion import QUANT_OPS, empty_fp32, empty_i32
 from .inductor_pass import enable_fake_mode
 from .vllm_inductor_pass import VllmInductorPass
 
@@ -146,14 +146,10 @@ class AttentionFp8StaticQuantPattern(AttentionQuantPattern):
             return RESHAPE_OP(at1[1], [-1, self.num_heads * self.head_size])
 
         inputs = [
-            self.empty(5, self.num_heads, self.head_size,
-                       dtype=self.dtype),  # q
-            self.empty(5, self.num_heads, self.head_size,
-                       dtype=self.dtype),  # k
-            self.empty(5, self.num_heads, self.head_size,
-                       dtype=self.dtype),  # v
-            self.empty(5, self.num_heads, self.head_size,
-                       dtype=self.dtype),  # attn_output
+            self.empty(5, self.num_heads, self.head_size),  # q
+            self.empty(5, self.num_heads, self.head_size),  # k
+            self.empty(5, self.num_heads, self.head_size),  # v
+            self.empty(5, self.num_heads, self.head_size),  # attn_output
             self.empty_quant(5,
                              self.num_heads * self.head_size),  # quant_output
             empty_fp32(1, 1)  # scale
@@ -227,10 +223,10 @@ class AttentionNvfp4QuantPattern(AttentionQuantPattern):
             return output, at2[2]
 
         inputs = [
-            empty_bf16(5, self.num_heads, self.head_size),  # q
-            empty_bf16(5, self.num_heads, self.head_size),  # k
-            empty_bf16(5, self.num_heads, self.head_size),  # v
-            empty_bf16(5, self.num_heads, self.head_size),  # output_attn
+            self.empty(5, self.num_heads, self.head_size),  # q
+            self.empty(5, self.num_heads, self.head_size),  # k
+            self.empty(5, self.num_heads, self.head_size),  # v
+            self.empty(5, self.num_heads, self.head_size),  # output_attn
             self.empty_quant(5, self.num_heads * self.head_size //
                              2),  # output_quant
             empty_i32(128, round_up(self.num_heads * self.head_size // 16,
