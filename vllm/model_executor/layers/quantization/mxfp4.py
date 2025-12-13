@@ -960,6 +960,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 )
                 x_scale = x_scale.view(torch.float8_e4m3fn).reshape(*x.shape[:-1], -1)
 
+            output_shape = x.shape[:-1] + (self.hidden_size_unpadded,)
+            output = torch.empty(output_shape, dtype=torch.bfloat16, device=x.device)
+
             trtllm_gen_output = trtllm_fp4_block_scale_moe(
                 router_logits.to(torch.bfloat16),
                 None,  # routing_bias
@@ -988,13 +991,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 1 if layer.renormalize else 0,  # routing_method_type, renormalize
                 True,  # do finalize
                 tune_max_num_tokens=max(self.max_capture_size, 1),
+                output=output,
             )[0]
-
-            if self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_TRTLLM:
-                trtllm_gen_output = trtllm_gen_output[
-                    ..., : self.hidden_size_unpadded
-                ].contiguous()
-
             return trtllm_gen_output
         elif (
             self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS
@@ -1048,8 +1046,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     fc2_expert_weights=layer.w2_weight,
                 )
 
-            output_shape = x.shape[:-1] + (self.hidden_size,)
+            output_shape = x.shape[:-1] + (self.hidden_size_unpadded,)
             output = torch.empty(output_shape, dtype=torch.bfloat16, device=x.device)
+
             _ = flashinfer_cutlass_fused_moe(
                 input=fi_input,
                 token_selected_experts=topk_ids.to(torch.int).contiguous(),
@@ -1069,9 +1068,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 tune_max_num_tokens=max(self.max_capture_size, 1),
                 **extra_kwargs,
             )
-
-            if self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS:
-                output = output[..., : self.hidden_size_unpadded].contiguous()
 
             return output
         elif self.mxfp4_backend == Mxfp4Backend.TRITON:
