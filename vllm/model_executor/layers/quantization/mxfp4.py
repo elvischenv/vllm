@@ -275,6 +275,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         mxfp4_block = 32
 
+        self.hidden_size_unpadded = hidden_size
+
         if self.mxfp4_backend == Mxfp4Backend.MARLIN:
             # The moe marlin kernel requires that for each linear
             # n % 256 == 0 and k % 128 == 0.
@@ -987,6 +989,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 True,  # do finalize
                 tune_max_num_tokens=max(self.max_capture_size, 1),
             )[0]
+
+            if self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_TRTLLM:
+                trtllm_gen_output = trtllm_gen_output[
+                    ..., : self.hidden_size_unpadded
+                ].contiguous()
+
             return trtllm_gen_output
         elif (
             self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS
@@ -1040,7 +1048,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     fc2_expert_weights=layer.w2_weight,
                 )
 
-            output = torch.empty_like(x, dtype=torch.bfloat16)
+            output_shape = x.shape[:-1] + (self.hidden_size,)
+            output = torch.empty(output_shape, dtype=torch.bfloat16, device=x.device)
             _ = flashinfer_cutlass_fused_moe(
                 input=fi_input,
                 token_selected_experts=topk_ids.to(torch.int).contiguous(),
@@ -1060,6 +1069,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 tune_max_num_tokens=max(self.max_capture_size, 1),
                 **extra_kwargs,
             )
+
+            if self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS:
+                output = output[..., : self.hidden_size_unpadded].contiguous()
 
             return output
         elif self.mxfp4_backend == Mxfp4Backend.TRITON:
