@@ -289,6 +289,14 @@ def test_tp2_attn_quant_allreduce_rmsnorm(
     if "fp4" in model_name.lower() and not is_blackwell():
         pytest.skip("NVFP4 quant requires Blackwell")
 
+    if "gpt-oss" in model_name:
+        if is_blackwell():
+            monkeypatch.setenv("VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8", "1")
+        else:
+            pytest.skip(
+                "Currently only Blackwell has completed fusion supports for GPT-OSS"
+            )
+
     if backend == AttentionBackendEnum.FLASHINFER and not is_blackwell():
         # FlashInfer attn fusion requires Blackwell
         matches = matches._replace(attention_fusion=0)

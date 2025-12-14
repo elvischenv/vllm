@@ -596,7 +596,7 @@ class FusedMoE(CustomOp):
             moe_quant_params["intermediate_size_full"] = intermediate_size
 
         self.quant_method.create_weights(layer=self, **moe_quant_params)
-        self.is_mxfp8_quant = (
+        self.support_padded_mxfp8_quant = (
             hasattr(self.quant_method, "mxfp8_quant_alignment")
             and self.quant_method.mxfp8_quant_alignment is not None
         )
@@ -1659,7 +1659,7 @@ class FusedMoE(CustomOp):
         og_hidden_states = hidden_states.shape[-1]
         # No need to explicitly pad the hidden size for mxfp8 quantization
         # It will be padded in mxfp8_quantize() before MoE
-        if not self.is_mxfp8_quant and self.hidden_size != og_hidden_states:
+        if not self.support_padded_mxfp8_quant and self.hidden_size != og_hidden_states:
             hidden_states = F.pad(
                 hidden_states,
                 (0, self.hidden_size - og_hidden_states),

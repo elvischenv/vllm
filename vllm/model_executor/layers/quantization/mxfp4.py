@@ -315,8 +315,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 intermediate_size_per_partition, 128
             )
             hidden_size = round_up(hidden_size, 128)
-            if self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS:
-                self.mxfp8_quant_alignment = 128
         elif current_platform.is_rocm():
             pad_align = get_padding_alignment()
             intermediate_size_per_partition = round_up(
@@ -328,10 +326,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 intermediate_size_per_partition, 64
             )
 
-        self.hidden_size = layer.hidden_size = hidden_size
         self.intermediate_size = layer.intermediate_size_per_partition = (
             intermediate_size_per_partition
         )
+        self.hidden_size = layer.hidden_size = hidden_size
 
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
@@ -949,9 +947,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 assert x.dtype == torch.bfloat16
                 x_quant = x
                 x_scale = None
+                output = None
             elif self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_TRTLLM:
                 from flashinfer import mxfp8_quantize
 
+                # input hidden size will be padded after mxfp8 quantization
                 assert self.mxfp8_quant_alignment is not None
                 x_quant, x_scale = mxfp8_quantize(
                     x,
@@ -960,8 +960,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 )
                 x_scale = x_scale.view(torch.float8_e4m3fn).reshape(*x.shape[:-1], -1)
 
-            output_shape = x.shape[:-1] + (self.hidden_size_unpadded,)
-            output = torch.empty(output_shape, dtype=torch.bfloat16, device=x.device)
+                # output will be with unpadded hidden size
+                output_shape = x.shape[:-1] + (self.hidden_size_unpadded,)
+                output = torch.empty(
+                    output_shape, dtype=torch.bfloat16, device=x.device
+                )
 
             trtllm_gen_output = trtllm_fp4_block_scale_moe(
                 router_logits.to(torch.bfloat16),
@@ -1009,12 +1012,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             if self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS:
                 from flashinfer import mxfp8_quantize
 
-                assert self.mxfp8_quant_alignment is not None
-                x_quant, x_scale = mxfp8_quantize(
-                    x,
-                    is_sf_swizzled_layout=True,
-                    alignment=self.mxfp8_quant_alignment,
-                )
+                x_quant, x_scale = mxfp8_quantize(x, True, 32)
 
                 fake_input_scale = torch.ones(self.num_experts, device=x.device)
                 quant_scales = [
@@ -1046,9 +1044,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     fc2_expert_weights=layer.w2_weight,
                 )
 
-            output_shape = x.shape[:-1] + (self.hidden_size_unpadded,)
-            output = torch.empty(output_shape, dtype=torch.bfloat16, device=x.device)
-
+            output = torch.empty_like(x, dtype=torch.bfloat16)
             _ = flashinfer_cutlass_fused_moe(
                 input=fi_input,
                 token_selected_experts=topk_ids.to(torch.int).contiguous(),
