@@ -600,6 +600,8 @@ class FusedMoE(CustomOp):
             hasattr(self.quant_method, "mxfp8_quant_alignment")
             and self.quant_method.mxfp8_quant_alignment is not None
         )
+        # create_weights may pad hidden_size
+        self.moe_config.hidden_dim = self.hidden_size
 
         # Chunked all2all staging tensor
         self.batched_hidden_states: torch.Tensor | None = None
