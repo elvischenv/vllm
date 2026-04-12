@@ -71,6 +71,7 @@ def test_tp2_async_tp_fp8_fusions(
             enable_sp=True,
             fuse_gemm_comms=True,
             fuse_allreduce_rms=False,
+            fuse_rope_kvcache=False,  # FIXME: disable to avoid compile range split
             # Override threshold for testing (models have small hidden_size)
             sp_min_token_num=512,
         ),
@@ -132,6 +133,7 @@ def test_tp2_async_tp_fusions(
             enable_sp=True,
             fuse_gemm_comms=True,
             fuse_allreduce_rms=False,
+            fuse_rope_kvcache=False,  # FIXME: disable to avoid compile range split
             # Override threshold for testing (models have small hidden_size)
             sp_min_token_num=512,
         ),
@@ -197,6 +199,7 @@ def test_tp2_sp_ar_rms_fp8_fusions(
             enable_sp=True,
             fuse_gemm_comms=True,
             fuse_allreduce_rms=True,
+            fuse_rope_kvcache=False,  # FIXME: disable to avoid compile range split
             # Override threshold for testing (models have small hidden_size)
             sp_min_token_num=512,
         ),
@@ -258,6 +261,7 @@ def test_tp2_sp_ar_rms_fusions(
             enable_sp=True,
             fuse_gemm_comms=True,
             fuse_allreduce_rms=True,
+            fuse_rope_kvcache=False,  # FIXME: disable to avoid compile range split
             # Override threshold for testing (models have small hidden_size)
             sp_min_token_num=512,
         ),
