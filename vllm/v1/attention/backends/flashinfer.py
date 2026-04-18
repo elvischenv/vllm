@@ -15,7 +15,6 @@ from flashinfer import (
     MultiLevelCascadeAttentionWrapper,
 )
 from flashinfer.decode import fast_decode_plan, trtllm_batch_decode_with_kv_cache
-from flashinfer.page import get_batch_indices_positions
 from flashinfer.prefill import trtllm_batch_context_with_kv_cache
 from flashinfer.rope import rope_quantize_fp8_append_paged_kv_cache
 from flashinfer.utils import FP4Tensor
@@ -74,6 +73,7 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVQuantMode,
     UniformTypeKVCacheSpecs,
+    get_dtype_size,
 )
 from vllm.v1.utils import CpuGpuBuffer
 
@@ -534,16 +534,6 @@ class FlashInferMetadata:
 
     cascade_wrapper: MultiLevelCascadeAttentionWrapper | None
 
-    # --- For RoPE + FP8 Quantize + KV Cache Update Kernel ---
-    paged_kv_indices: torch.Tensor | None = None
-    """Physical page indices for paged KV cache."""
-    paged_kv_indptr: torch.Tensor | None = None
-    """Cumulative page count per request."""
-    batch_indices: torch.Tensor | None = None
-    """Request index for each token."""
-    paged_positions: torch.Tensor | None = None
-    """Position within each request's KV sequence."""
-
 
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     reorder_batch_threshold: int = 1
@@ -700,24 +690,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         )  # Extra buffer for mutable paged_kv_indptr.cpu in cuda graph mode
         self.paged_kv_indices = self._make_buffer(max_num_pages)
         self.paged_kv_last_page_len = self._make_buffer(max_num_reqs)
-
-        self.enabled_rope_quant_cache_fusion = (
-            self.compilation_config.pass_config.fuse_rope_kvcache
-            and self.cache_dtype.startswith("fp8")
-            and can_use_trtllm
-        )
-        if self.enabled_rope_quant_cache_fusion:
-            max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-            self.batch_indices = torch.empty(
-                max_num_tokens,
-                device=device,
-                dtype=torch.int32,
-            )
-            self.paged_positions = torch.empty(
-                max_num_tokens,
-                device=device,
-                dtype=torch.int32,
-            )
 
     def _make_buffer(
         self, *size: int | torch.SymInt, dtype: torch.dtype = torch.int32
@@ -998,12 +970,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # When all attention (both prefill and decode) uses TRTLLM,
         # seq_lens_cpu is not needed since TRTLLM paths use GPU tensors
         # (block_tables, seq_lens) directly.
-        needs_seq_lens_cpu = (
-            self.use_dcp
-            or use_cascade
-            or not all_uses_trtllm
-            or self.enabled_rope_quant_cache_fusion
-        )
+        needs_seq_lens_cpu = self.use_dcp or use_cascade or not all_uses_trtllm
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu if needs_seq_lens_cpu else None
         seq_lens_np = seq_lens_cpu.numpy() if seq_lens_cpu is not None else None
         num_blocks_np = (
@@ -1043,11 +1010,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # Compute paged_kv_indices if necessary
         # paged_kv_indices is only needed for FlashInfer native paths;
         # TRTLLM paths use block_tables directly on GPU.
-        needs_paged_kv_indices = (
-            use_cascade
-            or not all_uses_trtllm
-            or self.enabled_rope_quant_cache_fusion
-        )
+        needs_paged_kv_indices = use_cascade or not all_uses_trtllm
         if needs_paged_kv_indices:
             assert num_blocks_np is not None
             assert seq_lens_np is not None
@@ -1259,23 +1222,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     disable_split_kv=self.disable_split_kv,
                 )
                 attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
-
-        # Step 4: Pre-compute params for RoPE + FP8 quantize + KV cache update fusion
-        # kernel here to avoid per-layer computation in do_rope_and_kv_cache_update.
-        if self.enabled_rope_quant_cache_fusion:
-            assert paged_kv_indices is not None
-            attn_metadata.paged_kv_indices = paged_kv_indices
-            attn_metadata.paged_kv_indptr = self.paged_kv_indptr.gpu[: num_reqs + 1]
-            attn_metadata.batch_indices = self.batch_indices[:num_actual_tokens]
-            attn_metadata.paged_positions = self.paged_positions[:num_actual_tokens]
-            get_batch_indices_positions(
-                qo_indptr[: num_reqs + 1],
-                seq_lens[:num_reqs],
-                num_actual_tokens,
-                attn_metadata.batch_indices,
-                attn_metadata.paged_positions,
-            )
-
         return attn_metadata
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:
@@ -1290,6 +1236,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
 class FlashInferImpl(AttentionImpl):
     can_return_lse_for_decode: bool = True
+
+    # Shared buffers used by the `rope_quantize_fp8_append_paged_kv_cache` kernel in
+    # `do_rope_and_kv_cache_update()`. They are ClassVars so that every attention
+    # layer's FlashInferImpl instance sees and reuses the same underlying tensors.
+    _kv_indptr: ClassVar[torch.Tensor | None] = None
+    _kv_indices: ClassVar[torch.Tensor | None] = None
 
     def __init__(
         self,
@@ -1365,6 +1317,45 @@ class FlashInferImpl(AttentionImpl):
             self.dcp_combine = partial(dcp_a2a_lse_reduce, is_lse_base_on_e=False)
         else:
             self.dcp_combine = partial(cp_lse_ag_out_rs, is_lse_base_on_e=False)
+
+        # Initialize shared buffers for `rope_quantize_fp8_append_paged_kv_cache` kernel
+        if (
+            vllm_config is not None
+            and vllm_config.compilation_config.pass_config.fuse_rope_kvcache
+            and self.kv_cache_dtype.startswith("fp8")
+            and self.support_trtllm_attn
+        ):
+            device = current_platform.current_device()
+            if FlashInferImpl._kv_indptr is None:
+                FlashInferImpl._kv_indptr = torch.zeros(
+                    2, device=device, dtype=torch.int32
+                )
+            # Size _kv_indices to an upper bound on num_phys_pages.
+            if FlashInferImpl._kv_indices is None:
+                cache_config = vllm_config.cache_config
+                if cache_config.num_gpu_blocks_override is not None:
+                    max_phys_pages = cache_config.num_gpu_blocks_override
+                else:
+                    total_gpu_mem = torch.cuda.get_device_properties(
+                        device
+                    ).total_memory
+                    bytes_per_page = (
+                        2
+                        * cache_config.block_size
+                        * self.num_kv_heads
+                        * self.head_size
+                        * get_dtype_size(FP8_DTYPE)
+                    )
+                    max_phys_pages = int(
+                        total_gpu_mem
+                        * cache_config.gpu_memory_utilization
+                        / max(bytes_per_page, 1)
+                    )
+                    max_phys_pages = min(max_phys_pages + 1024, 1 << 24)
+                    max_phys_pages = max(max_phys_pages, 4096)
+                FlashInferImpl._kv_indices = torch.arange(
+                    max_phys_pages, device=device, dtype=torch.int32
+                )
 
     def fused_output_quant_supported(self, quant_key: QuantKey):
         return (
@@ -1815,15 +1806,9 @@ class FlashInferImpl(AttentionImpl):
         is_neox: bool,
         kv_cache: torch.Tensor,
         layer_slot_mapping: torch.Tensor,
-        attn_metadata: FlashInferMetadata | None = None,
         query_quant_scale: torch.Tensor | None = None,
         query_quant_out: torch.Tensor | None = None,
     ):
-        if attn_metadata is None:
-            # Skip this in piecewise cudagraph capturing since the kernel requires
-            # access to the attn_metadata
-            return
-
         assert cos_sin_cache.dtype == torch.float32
         assert query_quant_scale is not None
         assert query_quant_out is not None
@@ -1856,6 +1841,9 @@ class FlashInferImpl(AttentionImpl):
             k_nope = None
             q_nope_out = None
 
+        assert FlashInferImpl._kv_indices is not None
+        assert FlashInferImpl._kv_indices.numel() >= kv_cache.shape[0]
+
         rope_quantize_fp8_append_paged_kv_cache(
             q_rope=q_rope,
             k_rope=k_rope,
@@ -1865,10 +1853,10 @@ class FlashInferImpl(AttentionImpl):
             cos_sin_cache=cos_sin_cache,
             pos_ids=positions,
             paged_kv_cache=(k_cache, v_cache),
-            kv_indices=attn_metadata.paged_kv_indices,
-            kv_indptr=attn_metadata.paged_kv_indptr,
-            batch_indices=attn_metadata.batch_indices,
-            positions=attn_metadata.paged_positions,
+            kv_indices=FlashInferImpl._kv_indices,
+            kv_indptr=FlashInferImpl._kv_indptr,
+            batch_indices=layer_slot_mapping.clamp(max=0),
+            positions=layer_slot_mapping,
             is_neox=is_neox,
             quantize_dtype=quant_dtype,
             quant_scale_q=layer._q_scale_float,

@@ -745,7 +745,6 @@ class TritonAttentionImpl(AttentionImpl):
         is_neox: bool,
         kv_cache: torch.Tensor,
         layer_slot_mapping: torch.Tensor,
-        attn_metadata: TritonAttentionMetadata | None = None,
         query_quant_scale: torch.Tensor | None = None,
         query_quant_out: torch.Tensor | None = None,
     ):

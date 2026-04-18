@@ -57,9 +57,7 @@ def fused_rope_and_unified_kv_cache_update_impl(
     the data dependency between them to ensure torch.compile preserves ordering.
     """
     layer_name = _resolve_layer_name(layer_name)
-    attn_metadata, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(
-        layer_name
-    )
+    _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
     if layer_slot_mapping is not None:
         attn_layer.impl.do_rope_and_kv_cache_update(
             attn_layer,
@@ -71,7 +69,6 @@ def fused_rope_and_unified_kv_cache_update_impl(
             is_neox,
             kv_cache,
             layer_slot_mapping,
-            attn_metadata,
             query_quant_scale,
             query_quant_out,
         )
